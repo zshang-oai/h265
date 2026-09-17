@@ -262,6 +262,80 @@ func TestDecodeNALOutputsSurviveError(t *testing.T) {
 	}
 }
 
+func TestDecodeNALCorruptReferencesAndRecovery(t *testing.T) {
+	units := accessUnitFixture(t, "motion_320x240.h265")
+	var params []NALUnit
+	for _, nal := range units[0] {
+		if !nal.Type.IsVCL() {
+			params = append(params, nal)
+		}
+	}
+	var d Decoder
+	defer d.Reset()
+	if _, err := decodeTaggedNALs(&d, params, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Join after the IDR: missing references may be synthesized, but successful
+	// syntax decoding must not present dependent pictures as known-clean output.
+	marked, propagated := false, false
+	for i, unit := range units[1:] {
+		out, err := decodeTaggedNALs(&d, unit, uint64(i+1))
+		if err != nil {
+			t.Fatalf("decoding without the initial reference: %v", err)
+		}
+		for _, p := range out {
+			marked = true
+			if !p.Corrupt {
+				t.Fatal("picture depending on a lost IDR was reported clean")
+			}
+			p.Release()
+		}
+		decodedRef, missingRef := false, false
+		for _, refs := range d.ctuPrev.refPics {
+			for _, ref := range refs {
+				// A nonzero tag identifies an actual decoded picture rather
+				// than the initial synthetic reference. Its warning must carry.
+				if ref != nil && ref.Corrupt {
+					decodedRef = decodedRef || ref.Tag != 0
+					missingRef = missingRef || ref.Tag == 0
+				}
+			}
+		}
+		propagated = propagated || decodedRef && !missingRef
+	}
+	if !marked || !propagated {
+		t.Fatal("fixture did not exercise corrupted output and reference propagation")
+	}
+
+	var recovered []*Picture
+	for i, unit := range units[:2] {
+		out, err := decodeTaggedNALs(&d, unit, uint64(101+i))
+		if err != nil {
+			t.Fatalf("IDR recovery: %v", err)
+		}
+		recovered = append(recovered, out...)
+	}
+	recovered = append(recovered, d.Flush()...)
+	clean := 0
+	for _, p := range recovered {
+		defer p.Release()
+		if p.Tag < 101 {
+			if !p.Corrupt {
+				t.Fatal("delayed picture lost its corrupt-reference warning")
+			}
+			continue
+		}
+		if p.Corrupt {
+			t.Fatal("a fresh IDR and its dependent picture remained corrupt")
+		}
+		clean++
+	}
+	if clean != 2 {
+		t.Fatalf("recovered pictures=%d, want IDR and following picture", clean)
+	}
+}
+
 func TestDecodeNALFrameSizeLimitSurvivesReset(t *testing.T) {
 	unit := accessUnitFixture(t, "inter_p.h265")[0]
 	var d Decoder

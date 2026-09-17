@@ -33,6 +33,14 @@ type Picture struct {
 	// picture through output reordering; the decoder does not interpret it.
 	Tag uint64
 
+	// Corrupt warns that this picture may contain prediction damage: any slice's
+	// active reference list includes an unavailable or previously damaged picture.
+	// Like FFmpeg's AV_FRAME_FLAG_CORRUPT, this does not make returned output a
+	// fatal decode error; the caller decides whether to use it or seek recovery.
+	// The check is conservative, not a per-block damage map. False means no such
+	// dependency was detected, not that all bitstream damage has been ruled out.
+	Corrupt bool
+
 	Y, Cb, Cr       []uint8
 	Y16, Cb16, Cr16 []uint16
 

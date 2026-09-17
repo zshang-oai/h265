@@ -46,6 +46,12 @@ Use `SplitAnnexB` or `SplitHVCC` to frame complete input into NAL units.
 Use `Flush` at end of stream, not after each frame. `Reset` discards pending output,
 references and parameter sets while preserving configured limits; already returned
 pictures remain valid until `Release`. Decode errors also reset the decoder.
+`Picture.Corrupt` warns when an active reference list contains an unavailable or
+previously damaged picture, allowing the application to request recovery without
+treating every synthesized reference as a syntax error. Like FFmpeg's per-frame
+corruption flag, it reports potentially damaged output, not a fatal decode error.
+The warning is conservative: it does not identify damaged pixels, and a false
+value is not a guarantee that every kind of bitstream damage has been detected.
 
 Set `FrameSizeLimit` and `Threads` to the application's decoded-size and worker
 budgets, and limit compressed input before parsing it. Picture planes are read-only;

@@ -300,6 +300,9 @@ func (d *Decoder) decodeSlice(nal NALUnit) ([]*Picture, error) {
 	if !first && d.ctu == nil {
 		return nil, ErrInvalid
 	}
+	if nal.TemporalID > s.maxSubLayersMinus1 {
+		return nil, ErrInvalid
+	}
 
 	if n := d.frameSizeLimit; n > 0 &&
 		int(s.picWidthInLumaSamples)*int(s.picHeightInLumaSamples) > n {
@@ -320,6 +323,11 @@ func (d *Decoder) decodeSlice(nal NALUnit) ([]*Picture, error) {
 	} else {
 		indep := *sh
 		d.prevSlic = &indep
+	}
+	// 7.4.7.1 bounds the entire RPS, including pictures kept for later use,
+	// by this picture's temporal-layer capacity minus its own slot.
+	if sh.stRPS.numDeltaPocs()+len(sh.ltRPS.pocLsbLt) > int(s.maxDecPicBufferingByLayer[nal.TemporalID]) {
+		return nil, ErrInvalid
 	}
 
 	if err := p.resolveTileGeometry(s); err != nil {
@@ -378,6 +386,26 @@ func (d *Decoder) decodeSlice(nal NALUnit) ([]*Picture, error) {
 			done = append(done, d.dpbDrain(true)...)
 		}
 
+		missing := 0
+		if sh.sliceType != sliceI {
+			for _, list := range [][]int32{rps.stCurrBefore, rps.stCurrAfter,
+				rps.ltCurr, rps.stFoll, rps.ltFoll} {
+				for _, poc := range list {
+					if d.dpbFind(poc) == nil {
+						missing++
+					}
+				}
+			}
+		}
+		// Unavailable references take real slots too. Release pending output
+		// before allocating them and the current picture, preserving POC order.
+		for len(d.dpb)+missing+1 > d.maxDecPicBuf {
+			q := d.dpbBump()
+			if q == nil {
+				return done, ErrInvalid
+			}
+			done = append(done, q)
+		}
 		if sh.sliceType != sliceI {
 			d.generateUnavailable(&rps, s)
 		}
@@ -648,6 +676,11 @@ func (d *Decoder) buildRefLists(sh *sliceHeader) {
 		for i, p := range pocs {
 			d.ctu.refPics[l][i] = d.dpbFind(p)
 			d.ctu.refLong[l][i] = d.dpbLongTerm(p)
+			if ref := d.ctu.refPics[l][i]; ref == nil || ref.Corrupt {
+				// An active list is a conservative dependency bound; following
+				// references retained only for later pictures do not taint this one.
+				d.cur.Corrupt = true
+			}
 		}
 	}
 

@@ -187,6 +187,129 @@ func TestParameterSets(t *testing.T) {
 	}
 }
 
+func TestSPSOrderingLimits(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		level         uint8
+		width, height uint32
+		profile       uint8
+		compat        uint32
+		highestOnly   bool
+		unspecified   bool
+		layers        [][3]uint32 // DPB minus1, reorder depth, latency plus1
+		want          error
+	}{
+		{name: "immediate output", layers: [][3]uint32{{0, 0, 0}}},
+		{name: "largest DPB", layers: [][3]uint32{{15, 15, 0}}},
+		{name: "increasing layers", layers: [][3]uint32{{1, 0, 0}, {3, 2, 0}}},
+		{name: "inferred lower layer", highestOnly: true, layers: [][3]uint32{{3, 2, 0}, {3, 2, 0}}},
+		{name: "largest latency", layers: [][3]uint32{{1, 0, 1<<32 - 2}}},
+		{name: "too many pictures", layers: [][3]uint32{{16, 0, 0}}, want: ErrInvalid},
+		{name: "unbounded level within budget", level: 255, layers: [][3]uint32{{15, 15, 0}}},
+		{name: "unbounded level storage", level: 255, layers: [][3]uint32{{16, 0, 0}}, want: ErrUnsupported},
+		{name: "reorder exceeds capacity", layers: [][3]uint32{{0, 1, 0}}, want: ErrInvalid},
+		{name: "decreasing capacity", layers: [][3]uint32{{3, 0, 0}, {1, 0, 0}}, want: ErrInvalid},
+		{name: "decreasing reorder depth", layers: [][3]uint32{{3, 2, 0}, {3, 1, 0}}, want: ErrInvalid},
+		// A.4.2 changes the allowance at one quarter, one half and three
+		// quarters of MaxLumaPs. These coded dimensions straddle each edge.
+		{name: "quarter", width: 96, height: 96, layers: [][3]uint32{{15, 15, 0}}},
+		{name: "above quarter", width: 112, height: 96, layers: [][3]uint32{{12, 0, 0}}, want: ErrInvalid},
+		{name: "half", width: 192, height: 96, layers: [][3]uint32{{11, 11, 0}}},
+		{name: "above half", width: 208, height: 96, layers: [][3]uint32{{8, 0, 0}}, want: ErrInvalid},
+		{name: "three quarters", width: 288, height: 96, layers: [][3]uint32{{7, 7, 0}}},
+		{name: "above three quarters", width: 304, height: 96, layers: [][3]uint32{{6, 0, 0}}, want: ErrInvalid},
+		{name: "full level picture", width: 192, height: 192, layers: [][3]uint32{{5, 5, 0}}},
+		{name: "picture exceeds level", width: 208, height: 192, layers: [][3]uint32{{0, 0, 0}}, want: ErrInvalid},
+		{name: "1080p level 4.1", level: 123, width: 1920, height: 1088, layers: [][3]uint32{{5, 5, 0}}},
+		{name: "1080p level 4.1 over capacity", level: 123, width: 1920, height: 1088, layers: [][3]uint32{{6, 0, 0}}, want: ErrInvalid},
+		{name: "8K level 6.2", level: 186, width: 7680, height: 4320, layers: [][3]uint32{{6, 0, 0}}, want: ErrInvalid},
+		{name: "8K level 6.3", level: 189, width: 7680, height: 4320, layers: [][3]uint32{{11, 11, 0}}},
+		{name: "8K level 7.2", level: 216, width: 7680, height: 4320, layers: [][3]uint32{{15, 15, 0}}},
+		{name: "unknown level", level: 217, layers: [][3]uint32{{0, 0, 0}}, want: ErrUnsupported},
+		// Existing x265 still streams overdeclare storage; keep accepting
+		// them within the general video-level budget.
+		{name: "still storage compatibility", profile: 3, layers: [][3]uint32{{4, 2, 0}}},
+		{name: "still exceeds general budget", profile: 3, layers: [][3]uint32{{16, 0, 0}}, want: ErrInvalid},
+		{name: "legacy unspecified PTL", unspecified: true, layers: [][3]uint32{{15, 15, 0}}},
+		{name: "legacy storage budget", unspecified: true, layers: [][3]uint32{{16, 0, 0}}, want: ErrUnsupported},
+		{name: "SCC base capacity", profile: 9, width: 192, height: 192, layers: [][3]uint32{{6, 6, 0}}},
+		{name: "SCC Main compatibility", profile: 9, compat: 1 << (31 - 1), width: 192, height: 192, layers: [][3]uint32{{6, 0, 0}}, want: ErrInvalid},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// Build a complete small SPS so rejection cannot be explained by
+			// a missing field or truncated trailing bits after the ordering data.
+			var w putBits
+			w.bits(0, 4)
+			w.bits(uint64(len(tt.layers)-1), 3)
+			w.bit(1)
+			profile, level := tt.profile, tt.level
+			if profile == 0 && !tt.unspecified {
+				profile = 1
+			}
+			if level == 0 && !tt.unspecified {
+				level = 30
+			}
+			w.bits(0, 3) // profile space and tier
+			w.bits(uint64(profile), 5)
+			w.bits(uint64(tt.compat), 32)
+			w.bits(0b1011, 4) // progressive, non-packed, frame-only
+			w.bits(0, 44)     // profile constraints
+			w.bits(uint64(level), 8)
+			if len(tt.layers) > 1 {
+				w.bits(0, 16) // sub-layer profile/level flags and reserved bits
+			}
+			w.ue(0) // SPS ID
+			w.ue(1) // 4:2:0
+			width, height := tt.width, tt.height
+			if width == 0 {
+				width, height = 64, 64
+			}
+			w.ue(width)
+			w.ue(height)
+			w.bit(0) // no conformance window
+			w.ue(0)  // eight-bit luma
+			w.ue(0)  // eight-bit chroma
+			w.ue(4)  // eight-bit POC LSB
+			w.bit(boolToBit(!tt.highestOnly))
+			layers := tt.layers
+			if tt.highestOnly {
+				layers = layers[len(layers)-1:]
+			}
+			for _, layer := range layers {
+				for _, v := range layer {
+					w.ue(v)
+				}
+			}
+			w.ue(1)      // minimum coding block: 16
+			w.ue(0)      // coding tree block: 16
+			w.ue(0)      // minimum transform: 4
+			w.ue(2)      // maximum transform: 16
+			w.ue(0)      // inter transform hierarchy
+			w.ue(0)      // intra transform hierarchy
+			w.bits(0, 4) // scaling lists, AMP, SAO, PCM disabled
+			w.ue(0)      // no short-term reference sets
+			w.bits(0, 5) // long-term refs, temporal MVP, smoothing, VUI, extensions
+			w.rbspTrailingBits()
+
+			s, err := parseSPS(w.bytes())
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("parseSPS: got %v, want %v", err, tt.want)
+			}
+			if tt.want == nil {
+				got := [3]uint32{s.maxDecPicBuffering, s.maxNumReorderPics, s.maxLatencyIncrease}
+				if want := tt.layers[len(tt.layers)-1]; got != want {
+					t.Fatalf("highest sub-layer limits: got %v, want %v", got, want)
+				}
+				for i, layer := range tt.layers {
+					if s.maxDecPicBufferingByLayer[i] != layer[0] {
+						t.Fatalf("sub-layer %d capacity: got %d, want %d", i, s.maxDecPicBufferingByLayer[i]+1, layer[0]+1)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestDefaultScalingList(t *testing.T) {
 	sl := defaultScalingList()
 

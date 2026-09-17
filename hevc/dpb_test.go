@@ -1,6 +1,103 @@
 package hevc
 
-import "testing"
+import (
+	"bytes"
+	"testing"
+)
+
+func TestMissingReferenceReservesPictureCapacity(t *testing.T) {
+	units := accessUnitFixture(t, "inter_p.h265")
+	var d Decoder
+	defer d.Reset()
+	for _, nal := range units[0] {
+		if !nal.Type.IsVCL() {
+			if _, err := d.DecodeNAL(nal); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	s := d.sps[0]
+	s.maxDecPicBuffering, s.maxNumReorderPics, s.maxLatencyIncrease = 1, 1, 0
+	s.maxDecPicBufferingByLayer[0] = 1
+	queued := newPicture(&d.pool, s)
+	queued.POC, queued.Tag = -1, 73
+	for i := range queued.Y {
+		queued.Y[i] = byte(i*17 + 3)
+	}
+	want := planarYUV(queued)
+	d.dpb = []dpbPicture{{pic: queued, output: true}}
+
+	// One pending output fits in a two-picture DPB and does not exceed the
+	// reorder depth. The P picture needs its absent POC-0 reference plus its
+	// own slot, so admission must output the old picture before synthesizing.
+	var out []*Picture
+	for _, nal := range units[1] {
+		pics, err := d.DecodeNAL(nal)
+		out = append(out, pics...)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range out {
+		defer p.Release()
+	}
+	if len(out) != 1 || out[0].Tag != 73 || !bytes.Equal(planarYUV(out[0]), want) {
+		t.Fatal("reserving missing-reference storage lost the queued picture or its tag")
+	}
+	if d.cur != nil || len(d.dpb) > d.maxDecPicBuf {
+		t.Fatalf("occupied pictures: DPB=%d, current=%v, capacity=%d", len(d.dpb), d.cur != nil, d.maxDecPicBuf)
+	}
+	ref, decoded := d.dpbFind(0), d.dpbFind(1)
+	if ref == nil || !ref.Corrupt || decoded == nil || !decoded.Corrupt {
+		t.Fatal("the absent reference was not synthesized and used by the P picture")
+	}
+}
+
+// A higher temporal layer's larger DPB cannot legitimize a reference set that
+// exceeds the current picture's own layer allowance (7.4.7.1).
+func TestReferenceSetUsesTemporalLayerCapacity(t *testing.T) {
+	units := accessUnitFixture(t, "inter_p.h265")
+	for _, tt := range []struct {
+		name       string
+		temporalID uint8
+		want       error
+	}{
+		{"base layer has no reference slot", 0, ErrInvalid},
+		{"upper layer has a reference slot", 1, nil},
+		{"layer exceeds SPS", 2, ErrInvalid},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var d Decoder
+			defer d.Reset()
+			for _, nal := range units[0] {
+				if !nal.Type.IsVCL() {
+					if _, err := d.DecodeNAL(nal); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			s := d.sps[0]
+			s.maxSubLayersMinus1, s.maxDecPicBuffering = 1, 1
+			s.maxDecPicBufferingByLayer = [maxSubLayers]uint32{0, 1}
+			var got error
+			for _, nal := range units[1] {
+				nal.TemporalID = tt.temporalID
+				pics, err := d.DecodeNAL(nal)
+				for _, p := range pics {
+					p.Release()
+				}
+				if err != nil {
+					got = err
+					break
+				}
+			}
+			if got != tt.want {
+				t.Fatalf("DecodeNAL: got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
 
 // A displayed reference picture remains in the DPB after its caller releases
 // it. Releasing that same output twice must not recycle its prediction samples.
@@ -95,6 +192,34 @@ func poolTestSPS(width uint32) *sps {
 		subHeightC:             2,
 		bitDepthLuma:           8,
 		bitDepthChroma:         8,
+	}
+}
+
+// A missing picture kept only for possible future use must not poison the
+// current output. Selecting it for prediction must expose the loss instead.
+func TestUnavailableReferenceWarningUsesActiveLists(t *testing.T) {
+	var d Decoder
+	defer d.Reset()
+	s := poolTestSPS(64)
+	clean := newPicture(&d.pool, s)
+	clean.POC = 1
+	d.dpb = []dpbPicture{{pic: clean, ref: true}}
+	d.curRPS = refPicSet{stCurrBefore: []int32{1}, stFoll: []int32{2}}
+	d.generateUnavailable(&d.curRPS, s)
+	if p := d.dpbFind(2); p == nil || !p.Corrupt || p.Y[0] != 128 {
+		t.Fatal("missing following reference was not synthesized as unavailable")
+	}
+	d.cur = newPicture(&d.pool, s)
+	d.ctu = &ctuDecoder{}
+	sh := &sliceHeader{sliceType: sliceP, numRefIdxL0Active: 1}
+	d.buildRefLists(sh)
+	if d.cur.Corrupt {
+		t.Fatal("an unused following reference marked the current picture corrupt")
+	}
+	d.curRPS = refPicSet{stCurrBefore: []int32{2}, stFoll: []int32{1}}
+	d.buildRefLists(sh)
+	if !d.cur.Corrupt {
+		t.Fatal("selecting the unavailable reference did not mark the picture corrupt")
 	}
 }
 

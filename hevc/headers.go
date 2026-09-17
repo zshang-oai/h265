@@ -14,6 +14,7 @@ const (
 	maxShortTermRPS     = 64
 	maxLongTermRefPics  = 32
 	maxRefPicsPerRPS    = 16
+	maxDpbPictures      = 16
 	maxTileColumns      = 22
 	maxTileRows         = 20
 	maxPicSize          = 16384
@@ -30,6 +31,12 @@ type profileTierLevel struct {
 	profileIDC   uint8
 	levelIDC     uint8
 	compatFlags  uint32
+}
+
+// hasProfile includes compatibility declarations: the stream must also obey
+// the constraints of every profile it claims compatibility with (7.4.4).
+func (p profileTierLevel) hasProfile(id uint8) bool {
+	return p.profileIDC == id || p.compatFlags&(uint32(1)<<(31-id)) != 0
 }
 
 type shortTermRPS struct {
@@ -85,9 +92,10 @@ type sps struct {
 	fullRange       bool
 	log2MaxPocLsb   uint8
 
-	maxDecPicBuffering uint32
-	maxNumReorderPics  uint32
-	maxLatencyIncrease uint32
+	maxDecPicBuffering        uint32
+	maxDecPicBufferingByLayer [maxSubLayers]uint32
+	maxNumReorderPics         uint32
+	maxLatencyIncrease        uint32
 
 	minCbLog2SizeY  uint8
 	ctbLog2SizeY    uint8
@@ -474,6 +482,81 @@ func checkTrailing(c *getBits, extension bool) error {
 	return nil
 }
 
+// maxDpbSize derives the highest temporal layer's general picture-storage limit
+// from Table A.8 and A.4.2 equation A-2 (H.265, 09/2023). Smaller coded pictures
+// allow more decoded pictures at the same level. For compatibility with x265
+// still streams, this checks the video-level envelope, not the stricter
+// one-picture-only profile constraints. Zero means no level-derived bound;
+// the separate maxDpbPictures implementation budget still applies.
+func (s *sps) maxDpbSize() (uint32, error) {
+	// Legacy HM streams can leave profile and level unspecified. Preserve
+	// their decoding without inventing a normative level limit for them.
+	if s.ptl.profileSpace == 0 && s.ptl.profileIDC == 0 && s.ptl.levelIDC == 0 {
+		return 0, nil
+	}
+	var maxDpbPicBuf uint32
+	for id := uint8(1); id <= 5; id++ {
+		if s.ptl.hasProfile(id) {
+			maxDpbPicBuf = 6
+			break
+		}
+	}
+	if maxDpbPicBuf == 0 {
+		// Screen-content profiles permit a current-picture reference and
+		// use seven base slots, even if this SPS does not enable that tool.
+		if s.ptl.hasProfile(9) || s.ptl.hasProfile(11) {
+			maxDpbPicBuf = 7
+		} else {
+			return 0, ErrUnsupported
+		}
+	}
+	if s.ptl.levelIDC == 255 {
+		// Level 8.5 imposes no DPB size limit.
+		return 0, nil
+	}
+
+	var maxLumaPs uint32
+	switch s.ptl.levelIDC {
+	case 30:
+		maxLumaPs = 36864
+	case 60:
+		maxLumaPs = 122880
+	case 63:
+		maxLumaPs = 245760
+	case 90:
+		maxLumaPs = 552960
+	case 93:
+		maxLumaPs = 983040
+	case 120, 123:
+		maxLumaPs = 2228224
+	case 150, 153, 156:
+		maxLumaPs = 8912896
+	case 180, 183, 186:
+		maxLumaPs = 35651584
+	case 189:
+		maxLumaPs = 80216064
+	case 210, 213, 216:
+		maxLumaPs = 142606336
+	default:
+		return 0, ErrUnsupported
+	}
+	// parseSPS has already bounded each dimension by maxPicSize.
+	picSize := s.picWidthInLumaSamples * s.picHeightInLumaSamples
+	if picSize > maxLumaPs {
+		return 0, ErrInvalid
+	}
+	switch {
+	case picSize <= maxLumaPs>>2:
+		return min(4*maxDpbPicBuf, 16), nil
+	case picSize <= maxLumaPs>>1:
+		return min(2*maxDpbPicBuf, 16), nil
+	case picSize <= (3*maxLumaPs)>>2:
+		return min(4*maxDpbPicBuf/3, 16), nil
+	default:
+		return maxDpbPicBuf, nil
+	}
+}
+
 func parseSPS(rbsp []byte) (*sps, error) {
 	var c getBits
 	c.init(rbsp)
@@ -544,6 +627,10 @@ func parseSPS(rbsp []byte) (*sps, error) {
 	}
 
 	s.log2MaxPocLsb = 4 + uint8(log2MaxPocLsbMinus4)
+	maxDpbSize, err := s.maxDpbSize()
+	if err != nil {
+		return nil, err
+	}
 
 	start := int(s.maxSubLayersMinus1)
 	if c.bit() != 0 {
@@ -551,9 +638,28 @@ func parseSPS(rbsp []byte) (*sps, error) {
 	}
 
 	for i := start; i <= int(s.maxSubLayersMinus1); i++ {
-		s.maxDecPicBuffering = c.ue()
-		s.maxNumReorderPics = c.ue()
+		buffering, reorder := c.ue(), c.ue()
 		s.maxLatencyIncrease = c.ue()
+
+		// 7.4.3.2.1: adding temporal layers cannot reduce DPB capacity or
+		// reorder depth, and the queued pictures must fit in the DPB.
+		if reorder > buffering || buffering < s.maxDecPicBuffering || reorder < s.maxNumReorderPics {
+			return nil, ErrInvalid
+		}
+
+		if maxDpbSize != 0 && buffering >= maxDpbSize {
+			return nil, ErrInvalid
+		}
+		// Level 8.5 and unspecified legacy PTL have no derived bound here.
+		if buffering >= maxDpbPictures {
+			return nil, ErrUnsupported
+		}
+
+		s.maxDecPicBufferingByLayer[i] = buffering
+		s.maxDecPicBuffering, s.maxNumReorderPics = buffering, reorder
+	}
+	for i := 0; i < start; i++ {
+		s.maxDecPicBufferingByLayer[i] = s.maxDecPicBuffering
 	}
 
 	log2MinCbSizeMinus3 := c.ue()
